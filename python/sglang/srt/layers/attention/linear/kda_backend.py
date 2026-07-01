@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -52,10 +53,18 @@ class KDAKernelDispatcher:
             )
 
             self.decode_kernel = CuteDSLKDAKernel()
+        elif decode_backend.is_cula():
+            if not is_cuda():
+                raise ValueError("KDA cuLA backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_cula import (
+                CulaKDAKernel,
+            )
+
+            self.decode_kernel = CulaKDAKernel()
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA currently only supports 'triton'."
+                "KDA supports 'triton', 'cutedsl', or 'cula'."
             )
 
         if prefill_backend.is_triton():
@@ -78,19 +87,33 @@ class KDAKernelDispatcher:
                 rank0_log(
                     "KDA cutedsl prefill needs SM100; falling back to Triton extend."
                 )
+        elif prefill_backend.is_cula():
+            # cuLA provides no KDA MTP prefill kernel; keep prefill on Triton.
+            self.extend_kernel = triton_kernel
+            rank0_log("KDA cula backend has no prefill kernel; using Triton extend.")
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton' or 'cutedsl' (cutedsl prefill needs SM100)."
+                "KDA supports 'triton', 'cutedsl', or 'cula' "
+                "(cutedsl prefill needs SM100; cula prefill falls back to Triton)."
             )
 
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
         )
 
+        # Verify kernel: cuLA implements the KDA MTP target-verify path; the
+        # Triton / CuTe DSL KDA kernels do not. target-verify is therefore only
+        # available when the decode backend is cula (None otherwise).
+        if decode_backend.is_cula():
+            self.verify_kernel = self.decode_kernel
+        else:
+            self.verify_kernel = None
+
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
-            f"extend={self.extend_kernel.__class__.__name__} "
+            f"extend={self.extend_kernel.__class__.__name__}, "
+            f"verify={self.verify_kernel.__class__.__name__ if self.verify_kernel else None} "
             f"packed_decode={self.supports_packed_decode}"
         )
 
@@ -181,6 +204,40 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
+    def target_verify(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self.verify_kernel is None:
+            raise NotImplementedError(
+                "KDA MTP target-verify requires the cuLA decode backend "
+                "(--linear-attn-decode-backend cula)."
+            )
+        return self.verify_kernel.target_verify(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
 
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
@@ -190,6 +247,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        # Identity slot map into the per-request intermediate SSM/conv buffers,
+        # used only on the speculative target-verify path (mirrors GDN).
+        self.verify_intermediate_state_indices = torch.arange(
+            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        )
 
     def forward_decode(
         self,
@@ -304,69 +366,143 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         ssm_states = mamba_cache_params.temporal
 
-        has_initial_state = forward_batch.extend_prefix_lens > 0
-
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
-        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
-            splits, dim=0
-        )
-        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
-        if layer.bias is not None:
-            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
-        else:
-            q_bias, k_bias, v_bias = None, None, None
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
 
-        q = causal_conv1d_fn(
-            q,
-            q_conv_weight,
-            q_bias,
-            activation="silu",
-            conv_states=q_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        k = causal_conv1d_fn(
-            k,
-            k_conv_weight,
-            k_bias,
-            activation="silu",
-            conv_states=k_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        v = causal_conv1d_fn(
-            v,
-            v_conv_weight,
-            v_bias,
-            activation="silu",
-            conv_states=v_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+        if is_target_verify:
+            # Speculative target-verify: run the conv as a multi-token packed
+            # update so per-draft-token intermediate conv windows + SSM snapshots
+            # are cached for accept-length rollback (mirrors the GDN verify path).
+            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[
+                0
+            ]
+            intermediate_state_cache = mamba_cache_params.intermediate_ssm
+
+            seq_len = mixed_qkv.shape[0]
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            batch_size = seq_len // draft_token_num
+            intermediate_state_indices = self.verify_intermediate_state_indices
+
+            retrieve_next_token = self.forward_metadata.retrieve_next_token
+            retrieve_next_sibling = self.forward_metadata.retrieve_next_sibling
+            retrieve_parent_token = self.forward_metadata.retrieve_parent_token
+
+            # (seq_len, dim) -> (batch, dim, draft_token_num) for the packed update.
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
+            # conv window is cached as (..., K-1, dim); the update wants (..., dim, K-1).
+            intermediate_conv_window_transposed = (
+                intermediate_conv_window_cache.transpose(-1, -2)
+            )
+            mixed_qkv_processed = causal_conv1d_update(
+                mixed_qkv_reshaped,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv_window_transposed,
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            q, k, v = mixed_qkv.split(splits, dim=-1)
+        else:
+            has_initial_state = forward_batch.extend_prefix_lens > 0
+            q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+            q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+                splits, dim=0
+            )
+            q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+            if layer.bias is not None:
+                q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            else:
+                q_bias, k_bias, v_bias = None, None, None
+
+            q = causal_conv1d_fn(
+                q,
+                q_conv_weight,
+                q_bias,
+                activation="silu",
+                conv_states=q_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            k = causal_conv1d_fn(
+                k,
+                k_conv_weight,
+                k_bias,
+                activation="silu",
+                conv_states=k_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            v = causal_conv1d_fn(
+                v,
+                v_conv_weight,
+                v_bias,
+                activation="silu",
+                conv_states=v_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
-        core_attn_out = self.kernel_dispatcher.extend(
-            q=q,
-            k=k,
-            v=v,
-            g=a,
-            beta=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            lower_bound=getattr(layer, "lower_bound", None),
-        )
+        if is_target_verify:
+            # cuLA kvbuffer (cg/tp) path passes u/kinv/b scratch when allocated;
+            # the recurrent (vk/ws) path leaves it empty and writes intermediate_ssm.
+            # PR1 does not allocate the kvbuffer scratch, so this stays recurrent.
+            verify_kwargs = {}
+            if getattr(mamba_cache_params, "kvbuffer_u", None) is not None:
+                verify_kwargs = dict(
+                    u_buffer=mamba_cache_params.kvbuffer_u[:batch_size],
+                    kinv_buffer=mamba_cache_params.kvbuffer_kinv[:batch_size],
+                    b_buffer=mamba_cache_params.kvbuffer_b[:batch_size],
+                )
+            core_attn_out = self.kernel_dispatcher.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices[:batch_size],
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=intermediate_state_cache,
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                cache_steps=draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
+                lower_bound=getattr(layer, "lower_bound", None),
+                **verify_kwargs,
+            )
+        else:
+            core_attn_out = self.kernel_dispatcher.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=a,
+                beta=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                lower_bound=getattr(layer, "lower_bound", None),
+            )
 
         return core_attn_out
