@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
+    get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -39,6 +40,7 @@ class KDAKernelDispatcher:
         self,
         decode_backend: LinearAttnKernelBackend,
         prefill_backend: LinearAttnKernelBackend,
+        verify_backend: LinearAttnKernelBackend,
     ):
         triton_kernel = TritonKDAKernel()
 
@@ -114,7 +116,28 @@ class KDAKernelDispatcher:
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
         )
-        self.verify_kernel = triton_kernel
+
+        # A cuLA verify backend (recurrent or ReplaySSM) is selected independently
+        # of decode via --linear-attn-verify-backend; only Triton and cuLA
+        # implement target_verify. Any other value keeps the decode-tied default
+        # verify kernel selected above.
+        if verify_backend.is_any_cula():
+            if not is_cuda():
+                raise ValueError("KDA cuLA verify backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_cula import (
+                CulaKDAKernel,
+            )
+
+            self.verify_kernel = CulaKDAKernel()
+        elif not verify_backend.is_triton():
+            raise ValueError(
+                f"Unsupported KDA verify backend: {verify_backend}. "
+                "KDA target-verify supports 'triton', 'cula', or 'cula-replayssm'."
+            )
+        # The ReplaySSM (ring-free) verify writes a compact (d,k,g) scratch
+        # instead of the recurrent per-token snapshot; the backend
+        # allocates/forwards it and folds it into the state at rollback.
+        self.verify_uses_replayssm = verify_backend.is_cula_replayssm()
 
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
@@ -300,7 +323,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "KDA FlashInfer speculative decoding only supports topk=1 "
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
-        self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        verify_backend = get_linear_attn_verify_backend()
+        self.kernel_dispatcher = KDAKernelDispatcher(
+            decode_backend, prefill_backend, verify_backend
+        )
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend).
         self.verify_intermediate_state_indices = torch.arange(
@@ -527,7 +553,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         intermediate_state_cache = getattr(mamba_cache_params, "intermediate_ssm", None)
-        if intermediate_state_cache is None:
+        # cuLA ReplaySSM (ring-free) verify writes a compact (d, k, g) scratch
+        # instead of the per-token intermediate_ssm snapshot (which is left
+        # unallocated in that mode); forward it when present. The recurrent /
+        # triton verify paths leave replayssm_scratch empty.
+        replayssm_scratch = {}
+        if mamba_cache_params.kda_mtp_replayssm_d is not None:
+            replayssm_scratch = dict(
+                replayssm_d=mamba_cache_params.kda_mtp_replayssm_d,
+                replayssm_k=mamba_cache_params.kda_mtp_replayssm_k,
+                replayssm_g=mamba_cache_params.kda_mtp_replayssm_g,
+            )
+        if intermediate_state_cache is None and not replayssm_scratch:
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
@@ -578,4 +615,5 @@ class KDAAttnBackend(MambaAttnBackendBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=draft_token_num,
             retrieve_parent_token=retrieve_parent_token,
+            **replayssm_scratch,
         )

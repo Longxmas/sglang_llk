@@ -671,6 +671,9 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             enable_linear_replayssm=self.server_args.enable_linear_replayssm,
             linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
+            use_kda_replayssm_verify=(
+                self.server_args.linear_attn_verify_backend == "cula-replayssm"
+            ),
             mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
         )
         return req_to_token_pool
@@ -1585,6 +1588,32 @@ class KVCacheConfigurator:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
+        # cuLA ReplaySSM verify commits every mamba layer into `temporal` with a
+        # single CuTe flush whose element offset i_l * (pool_size * HV * V * K) is
+        # accumulated in int32. A pool above 2**31 // (num_mamba_layers*HV*V*K)
+        # overflows and silently corrupts the upper layers. Keep the single-launch
+        # flush int32-safe: default the auto-sized (memory-budget) pool to a small
+        # safe capacity here, and clamp any explicit oversize after the sizing
+        # branches below.
+        is_cula_replayssm_verify = (
+            server_args.linear_attn_verify_backend == "cula-replayssm"
+        )
+        if is_cula_replayssm_verify:
+            hv, head_dim, state_dim = config.mamba2_cache_params.shape.temporal
+            num_mamba_layers = len(config.mamba2_cache_params.layers)
+            replayssm_pool_cap = (2**31 - 1) // (
+                num_mamba_layers * hv * head_dim * state_dim
+            )
+            pool_is_auto_sized = server_args.max_mamba_cache_size is None and not (
+                server_args.disable_radix_cache
+                and server_args.max_running_requests is not None
+            )
+            if pool_is_auto_sized:
+                server_args.override(
+                    "mamba_pool.replayssm_int32_safe_default",
+                    max_mamba_cache_size=min(512, replayssm_pool_cap),
+                )
+
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.override(
@@ -1678,6 +1707,21 @@ class KVCacheConfigurator:
                 f"(2) increase --mem-fraction-static, "
                 f"(3) reduce --speculative-num-draft-tokens, or "
                 f"(4) use GPUs with more memory."
+            )
+
+        if (
+            is_cula_replayssm_verify
+            and server_args.max_mamba_cache_size > replayssm_pool_cap
+        ):
+            logger.warning(
+                "cula-replayssm verify: capping max_mamba_cache_size %d -> %d so "
+                "the single-launch all-layers flush offset stays int32-safe.",
+                server_args.max_mamba_cache_size,
+                replayssm_pool_cap,
+            )
+            server_args.override(
+                "mamba_pool.replayssm_int32_cap",
+                max_mamba_cache_size=replayssm_pool_cap,
             )
 
         mamba_state_memory = (

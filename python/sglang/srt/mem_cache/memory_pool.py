@@ -326,6 +326,20 @@ class MambaPool:
         replayssm_d: Optional[torch.Tensor] = None
         replayssm_k: Optional[torch.Tensor] = None
         replayssm_g: Optional[torch.Tensor] = None
+        # cuLA KDA MTP chunkwise-verify scratch. Dedicated fields, kept SEPARATE
+        # from the ReplaySSM decode-ring d/k/g above (which current main uses for
+        # the KDA decode ring). Allocated only for
+        # `--linear-attn-verify-backend cula-replayssm`; per (layer, slot,
+        # draft-token), all fp32:
+        #   kda_mtp_replayssm_d: [num_layers, num_slots, draft_tokens, HV, V]  (u)
+        #   kda_mtp_replayssm_k: [num_layers, num_slots, draft_tokens, HV, K]  (key)
+        #   kda_mtp_replayssm_g: [num_layers, num_slots, draft_tokens, HV, K]  (per-K gate)
+        # The chunkwise verify kernel rewrites them each target-verify pass and
+        # kda_flush_kvbuffer_all_layers folds them into `temporal` at commit;
+        # there is no ring cursor (replayssm_write_pos stays None).
+        kda_mtp_replayssm_d: Optional[torch.Tensor] = None
+        kda_mtp_replayssm_k: Optional[torch.Tensor] = None
+        kda_mtp_replayssm_g: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -351,7 +365,9 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
+        # None under ReplaySSM (ring-free) verify (the compact (d,k,g) scratch
+        # replaces the per-token full-state snapshot to save memory).
+        intermediate_ssm: Optional[torch.Tensor] = None
         intermediate_conv_window: List[torch.Tensor]
 
     def _detect_conv_window_axis(
@@ -439,6 +455,7 @@ class MambaPool:
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        use_kda_replayssm_verify: bool = False,
         envelope_layout: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
@@ -570,20 +587,56 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device="cuda",
+                kda_mtp_replayssm_d = kda_mtp_replayssm_k = kda_mtp_replayssm_g = (
+                    None
                 )
+                if use_kda_replayssm_verify:
+                    # cuLA KDA ReplaySSM (ring-free) verify: a compact per-(layer, slot,
+                    # draft-token) (d, k, g) scratch (all fp32) replaces the
+                    # per-token full-state snapshot, which is skipped here. The
+                    # chunkwise verify kernel rewrites it each target-verify pass
+                    # and kda_flush_kvbuffer_all_layers folds it into `temporal`
+                    # at rollback. temporal_state_shape == (HV, V, K).
+                    hv, v_dim, k_dim = temporal_state_shape
+                    intermediate_ssm_state_cache = None
+                    kda_mtp_replayssm_d = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            hv,
+                            v_dim,
+                        ),
+                        dtype=torch.float32,
+                        device="cuda",
+                    )
+                    kda_mtp_replayssm_k = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            hv,
+                            k_dim,
+                        ),
+                        dtype=torch.float32,
+                        device="cuda",
+                    )
+                    kda_mtp_replayssm_g = torch.zeros_like(kda_mtp_replayssm_k)
+                else:
+                    # Cache intermediate SSM states per draft token during target verify
+                    # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                    intermediate_ssm_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                            temporal_state_shape[2],
+                        ),
+                        dtype=ssm_dtype,
+                        device="cuda",
+                    )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
                 #
@@ -665,13 +718,21 @@ class MambaPool:
                     replayssm_d=replayssm_d,
                     replayssm_k=replayssm_k,
                     replayssm_g=replayssm_g,
+                    kda_mtp_replayssm_d=kda_mtp_replayssm_d,
+                    kda_mtp_replayssm_k=kda_mtp_replayssm_k,
+                    kda_mtp_replayssm_g=kda_mtp_replayssm_g,
+                )
+                _inter_ssm_gb = (
+                    get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
+                    if intermediate_ssm_state_cache is not None
+                    else 0.0
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                    f"intermediate_ssm_state_cache size: {_inter_ssm_gb:.2f}GB "
                     # Report the deduplicated PHYSICAL conv-window buffers (the view
                     # over-reports its logical, un-deduplicated size).
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
@@ -697,6 +758,13 @@ class MambaPool:
                     f"d={get_tensor_size_bytes(replayssm_d) / GB:.3f}GB, "
                     f"k={get_tensor_size_bytes(replayssm_k) / GB:.3f}GB, "
                     f"g={get_tensor_size_bytes(replayssm_g) / GB:.3f}GB "
+                )
+            if self.mamba_cache.kda_mtp_replayssm_d is not None:
+                logger.info(
+                    f"cuLA KDA MTP ReplaySSM verify scratch allocated: "
+                    f"d={get_tensor_size_bytes(self.mamba_cache.kda_mtp_replayssm_d) / GB:.3f}GB, "
+                    f"k={get_tensor_size_bytes(self.mamba_cache.kda_mtp_replayssm_k) / GB:.3f}GB, "
+                    f"g={get_tensor_size_bytes(self.mamba_cache.kda_mtp_replayssm_g) / GB:.3f}GB "
                 )
             # Gate granularity of the linear-attn layers (drives the kernel's
             # IS_KDA path + the g_cache layout). Read by the backend metadata to
@@ -906,6 +974,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         start_layer: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        use_kda_replayssm_verify: bool = False,
         mamba_envelope_layout: bool = False,
     ):
         super().__init__(
@@ -932,6 +1001,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
+            use_kda_replayssm_verify=use_kda_replayssm_verify,
             mamba_envelope_layout=mamba_envelope_layout,
         )
 
@@ -947,6 +1017,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        use_kda_replayssm_verify: bool = False,
         mamba_envelope_layout: bool = False,
     ):
         self.mamba_pool = self.mamba_pool_cls(
@@ -960,6 +1031,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
+            use_kda_replayssm_verify=use_kda_replayssm_verify,
             envelope_layout=mamba_envelope_layout,
         )
         self.mamba_allocator = MambaSlotAllocator(

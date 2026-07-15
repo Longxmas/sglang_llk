@@ -1032,12 +1032,41 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
+        if mamba_caches.kda_mtp_replayssm_d is not None:
+            # cuLA ReplaySSM (ring-free) verify never materialises the
+            # intermediate_ssm snapshot; reconstruct the accepted state per
+            # layer from the (d, k, g) scratch. accept_len is per-request
+            # (accepted step + 1, range 1..T); idle rows (step < 0) map to a -1
+            # state index (cuLA's pad convention). Conv state still rolls back
+            # via the intermediate conv-window scatter below.
+            from sglang.jit_kernel.cula_kda import kda_flush_kvbuffer_all_layers
+
+            assert mamba_track_indices is None, (
+                "cuLA ReplaySSM verify does not support mamba radix tracking "
+                "(the intermediate_ssm snapshot is not materialised)"
+            )
+            valid = last_correct_step_indices >= 0
+            flush_indices = torch.where(
+                valid,
+                state_indices_tensor,
+                torch.full_like(state_indices_tensor, -1),
+            )
+            accept_len = (last_correct_step_indices + 1).clamp(min=1)
+            kda_flush_kvbuffer_all_layers(
+                ssm_states,
+                flush_indices,
+                mamba_caches.kda_mtp_replayssm_d,
+                mamba_caches.kda_mtp_replayssm_k,
+                mamba_caches.kda_mtp_replayssm_g,
+                accept_len,
+            )
+        else:
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
         # conv intermediate uses the deduplicated sliding-window layout, so it
         # needs the strided-read scatter variant.
         fused_conv_window_scatter_with_mask(

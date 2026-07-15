@@ -346,6 +346,10 @@ MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flashkda"]
+# Only triton (default) and cuLA implement the KDA speculative target_verify path.
+# "cula" uses the recurrent per-token snapshot; "cula-replayssm" uses a ring-free
+# ReplaySSM (d,k,g) scratch reconstructed at rollback.
+LINEAR_ATTN_VERIFY_BACKEND_CHOICES = ["triton", "cula", "cula-replayssm"]
 
 
 # Allow external code to add more choices
@@ -2086,6 +2090,13 @@ class ServerArgs:
         Arg(
             help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+        ),
+    ] = None
+    linear_attn_verify_backend: A[
+        Optional[str],
+        Arg(
+            help="Override the kernel backend for KDA speculative target-verify. Only 'triton' (default) and 'cula' implement target_verify; if not set, verify stays on triton. Selected independently of --linear-attn-decode-backend.",
+            choices=LINEAR_ATTN_VERIFY_BACKEND_CHOICES,
         ),
     ] = None
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
