@@ -350,6 +350,10 @@ class MambaPool:
         replayssm_rawv: Optional[torch.Tensor] = None
         replayssm_rawk: Optional[torch.Tensor] = None
         replayssm_beta: Optional[torch.Tensor] = None
+        # Ring-free cuLA KDA verify scratch, separate from persistent rings.
+        kda_mtp_replayssm_d: Optional[torch.Tensor] = None
+        kda_mtp_replayssm_k: Optional[torch.Tensor] = None
+        kda_mtp_replayssm_g: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -462,6 +466,7 @@ class MambaPool:
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        use_kda_replayssm_verify: bool = False,
         envelope_layout: bool = False,
         enable_gdn_replayssm_spec: bool = False,
     ):
@@ -487,6 +492,10 @@ class MambaPool:
         # `_replayssm_on` (either flag). GDN-only is enforced upstream + below.
         self.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
         _replayssm_on = enable_linear_replayssm or enable_gdn_replayssm_spec
+        # Only KDA consumes the dedicated ring-free verify scratch.
+        use_kda_replayssm_verify = bool(
+            use_kda_replayssm_verify and cache_params.is_kda
+        )
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -650,18 +659,28 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                #
-                # ReplaySSM spec-verify owns rollback via the ring + cursors (the
-                # verify kernel never writes per-draft snapshots; the commit never
-                # reads them), so this buffer -- the dominant spec scratch, ~46x
-                # the conv state -- is dead weight there and is skipped. The conv
-                # intermediate windows below STAY (conv rollback consumes them).
-                # The recurrent-verify fallback cannot be reached under the flag
-                # (GDN + linear chain + triton enforced in server_args; the
-                # backend asserts loudly if it ever is).
-                if enable_gdn_replayssm_spec:
+                # Cache recurrent snapshots or the dedicated ring-free cuLA scratch.
+                kda_mtp_replayssm_d = None
+                kda_mtp_replayssm_k = None
+                kda_mtp_replayssm_g = None
+                if use_kda_replayssm_verify:
+                    # temporal_state_shape is (HV, V, K) on CUDA KDA.
+                    hv, v_dim, k_dim = temporal_state_shape
+                    scratch_shape = (
+                        num_mamba_layers,
+                        spec_state_size + 1,
+                        speculative_num_draft_tokens,
+                        hv,
+                    )
+                    intermediate_ssm_state_cache = None
+                    kda_mtp_replayssm_d = torch.zeros(
+                        size=(*scratch_shape, v_dim), dtype=torch.float32, device=device
+                    )
+                    kda_mtp_replayssm_k = torch.zeros(
+                        size=(*scratch_shape, k_dim), dtype=torch.float32, device=device
+                    )
+                    kda_mtp_replayssm_g = torch.zeros_like(kda_mtp_replayssm_k)
+                elif enable_gdn_replayssm_spec:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -750,6 +769,9 @@ class MambaPool:
                     replayssm_rawv=replayssm_rawv,
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
+                    kda_mtp_replayssm_d=kda_mtp_replayssm_d,
+                    kda_mtp_replayssm_k=kda_mtp_replayssm_k,
+                    kda_mtp_replayssm_g=kda_mtp_replayssm_g,
                 )
                 intermediate_ssm_gb = (
                     get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
@@ -797,6 +819,13 @@ class MambaPool:
                         if enable_gdn_replayssm_spec
                         else ""
                     )
+                )
+            if self.mamba_cache.kda_mtp_replayssm_d is not None:
+                logger.info(
+                    "cuLA KDA MTP ReplaySSM scratch allocated: "
+                    f"d={get_tensor_size_bytes(self.mamba_cache.kda_mtp_replayssm_d) / GB:.3f}GB, "
+                    f"k={get_tensor_size_bytes(self.mamba_cache.kda_mtp_replayssm_k) / GB:.3f}GB, "
+                    f"g={get_tensor_size_bytes(self.mamba_cache.kda_mtp_replayssm_g) / GB:.3f}GB"
                 )
             # Gate granularity of the linear-attn layers (drives the kernel's
             # IS_KDA path + the g_cache layout). Read by the backend metadata to
@@ -1029,6 +1058,9 @@ class MambaPool:
             "replayssm_rawv",
             "replayssm_rawk",
             "replayssm_beta",
+            "kda_mtp_replayssm_d",
+            "kda_mtp_replayssm_k",
+            "kda_mtp_replayssm_g",
         }
     )
 
@@ -1137,6 +1169,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         start_layer: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        use_kda_replayssm_verify: bool = False,
         mamba_envelope_layout: bool = False,
         enable_gdn_replayssm_spec: bool = False,
     ):
@@ -1164,6 +1197,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
+            use_kda_replayssm_verify=use_kda_replayssm_verify,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
         )
@@ -1180,6 +1214,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        use_kda_replayssm_verify: bool = False,
         mamba_envelope_layout: bool = False,
         enable_gdn_replayssm_spec: bool = False,
     ):
@@ -1194,6 +1229,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
+            use_kda_replayssm_verify=use_kda_replayssm_verify,
             envelope_layout=mamba_envelope_layout,
             enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
         )

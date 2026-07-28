@@ -17,6 +17,8 @@ class LinearAttnKernelBackend(Enum):
     CUTEDSL = "cutedsl"
     FLASHINFER = "flashinfer"
     FLASHKDA = "flashkda"
+    CULA = "cula"
+    CULA_REPLAYSSM = "cula-replayssm"
     CUSTOM = "custom"
 
     @classmethod
@@ -35,26 +37,49 @@ class LinearAttnKernelBackend(Enum):
     def is_flashkda(self):
         return self == LinearAttnKernelBackend.FLASHKDA
 
+    def is_cula(self):
+        return self == LinearAttnKernelBackend.CULA
+
+    def is_cula_replayssm(self):
+        return self == LinearAttnKernelBackend.CULA_REPLAYSSM
+
+    def is_any_cula(self):
+        return self in (
+            LinearAttnKernelBackend.CULA,
+            LinearAttnKernelBackend.CULA_REPLAYSSM,
+        )
+
     def is_custom(self):
         return self == LinearAttnKernelBackend.CUSTOM
 
 
 LINEAR_ATTN_DECODE_BACKEND: Optional[LinearAttnKernelBackend] = None
 LINEAR_ATTN_PREFILL_BACKEND: Optional[LinearAttnKernelBackend] = None
+LINEAR_ATTN_VERIFY_BACKEND: Optional[LinearAttnKernelBackend] = None
 
 
 def initialize_linear_attn_config(server_args: ServerArgs):
     global LINEAR_ATTN_DECODE_BACKEND
     global LINEAR_ATTN_PREFILL_BACKEND
+    global LINEAR_ATTN_VERIFY_BACKEND
 
     base = server_args.linear_attn_backend
     decode = server_args.linear_attn_decode_backend or base
     prefill = server_args.linear_attn_prefill_backend or base
+    # Preserve the current FlashInfer decode-tied verify default. Other decode
+    # backends default to Triton; cuLA is selected explicitly and independently.
+    verify = server_args.linear_attn_verify_backend
+    if verify is None:
+        verify = "flashinfer" if decode == "flashinfer" else "triton"
 
     LINEAR_ATTN_DECODE_BACKEND = LinearAttnKernelBackend(decode)
     LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend(prefill)
+    LINEAR_ATTN_VERIFY_BACKEND = LinearAttnKernelBackend(verify)
 
-    rank0_log(f"Linear attention kernel backend: decode={decode}, prefill={prefill}")
+    rank0_log(
+        f"Linear attention kernel backend: decode={decode}, prefill={prefill}, "
+        f"verify={verify}"
+    )
 
 
 def get_linear_attn_decode_backend() -> LinearAttnKernelBackend:
@@ -75,3 +100,13 @@ def get_linear_attn_prefill_backend() -> LinearAttnKernelBackend:
         )
         LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend.TRITON
     return LINEAR_ATTN_PREFILL_BACKEND
+
+
+def get_linear_attn_verify_backend() -> LinearAttnKernelBackend:
+    global LINEAR_ATTN_VERIFY_BACKEND
+    if LINEAR_ATTN_VERIFY_BACKEND is None:
+        logger.warning(
+            "LINEAR_ATTN_VERIFY_BACKEND is not initialized, using triton backend"
+        )
+        LINEAR_ATTN_VERIFY_BACKEND = LinearAttnKernelBackend.TRITON
+    return LINEAR_ATTN_VERIFY_BACKEND

@@ -1114,13 +1114,51 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        scatter_mamba_states_after_mtp_verify(
-            mamba_caches,
-            state_indices_tensor,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-        )
+        if mamba_caches.kda_mtp_replayssm_d is not None:
+            # Ring-free KDA owns SSM commit; GDN keeps its cursor commit.
+            from sglang.kernels.ops.attention.cula_kda import (
+                kda_flush_kvbuffer_all_layers,
+            )
+            from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+                fused_conv_window_scatter_with_mask,
+            )
+
+            assert mamba_track_indices is None, (
+                "cuLA ReplaySSM verify does not support mamba radix tracking; "
+                "run with --disable-radix-cache"
+            )
+            valid = last_correct_step_indices >= 0
+            flush_indices = torch.where(
+                valid,
+                state_indices_tensor,
+                torch.full_like(state_indices_tensor, -1),
+            )
+            accept_len = (last_correct_step_indices + 1).clamp(min=1)
+            kda_flush_kvbuffer_all_layers(
+                mamba_caches.temporal,
+                flush_indices,
+                mamba_caches.kda_mtp_replayssm_d,
+                mamba_caches.kda_mtp_replayssm_k,
+                mamba_caches.kda_mtp_replayssm_g,
+                accept_len,
+            )
+            for conv_states, intermediate_conv_window_cache in zip(
+                mamba_caches.conv, mamba_caches.intermediate_conv_window
+            ):
+                fused_conv_window_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    state_indices_tensor,
+                    last_correct_step_indices,
+                )
+        else:
+            scatter_mamba_states_after_mtp_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):

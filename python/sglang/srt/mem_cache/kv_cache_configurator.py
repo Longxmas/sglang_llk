@@ -722,6 +722,9 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             enable_linear_replayssm=self.server_args.enable_linear_replayssm,
             linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
+            use_kda_replayssm_verify=(
+                self.server_args.linear_attn_verify_backend == "cula-replayssm"
+            ),
             mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
             # ReplaySSM spec-verify is GDN-only: activate the pool machinery
             # (rings + cursors + the intermediate_ssm gate) only for GDN-hybrid
@@ -1710,6 +1713,17 @@ class KVCacheConfigurator:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
+        is_cula_replayssm_verify = (
+            server_args.linear_attn_verify_backend == "cula-replayssm"
+            and config.mamba2_cache_params.is_kda
+        )
+        if is_cula_replayssm_verify:
+            hv, v_dim, k_dim = config.mamba2_cache_params.shape.temporal
+            num_mamba_layers = len(config.mamba2_cache_params.layers)
+            replayssm_pool_cap = (2**31 - 1) // (
+                num_mamba_layers * hv * v_dim * k_dim
+            )
+
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.override(
@@ -1787,6 +1801,21 @@ class KVCacheConfigurator:
                     "mamba_pool.memory_budget",
                     max_mamba_cache_size=int((mamba_budget_bytes - per_req) // per_req),
                 )
+
+        if (
+            is_cula_replayssm_verify
+            and server_args.max_mamba_cache_size > replayssm_pool_cap
+        ):
+            logger.warning(
+                "cula-replayssm verify: capping max_mamba_cache_size %d -> %d "
+                "so all-layer flush offsets stay int32-safe.",
+                server_args.max_mamba_cache_size,
+                replayssm_pool_cap,
+            )
+            server_args.override(
+                "mamba_pool.replayssm_int32_cap",
+                max_mamba_cache_size=replayssm_pool_cap,
+            )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
         # A non-positive value means GPU memory is insufficient for the requested

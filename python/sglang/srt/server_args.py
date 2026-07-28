@@ -345,6 +345,7 @@ MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flashkda"]
+LINEAR_ATTN_VERIFY_BACKEND_CHOICES = ["triton", "cula", "cula-replayssm"]
 
 
 # Allow external code to add more choices
@@ -2520,6 +2521,17 @@ class ServerArgs:
         Arg(
             help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+        ),
+        NS("exec.mamba"),
+    ] = None
+    linear_attn_verify_backend: A[
+        Optional[str],
+        Arg(
+            help="Override the KDA speculative target-verify kernel. "
+            "'cula' uses recurrent full-state snapshots; 'cula-replayssm' "
+            "uses compact ring-free (d,k,g) scratch. Decode and prefill remain "
+            "selected by their own backend flags.",
+            choices=LINEAR_ATTN_VERIFY_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
     ] = None
@@ -5945,6 +5957,29 @@ class ServerArgs:
                 "--linear-attn-prefill-backend flashinfer on SM100+ requires CUDA 13+, "
                 f"got CUDA {cuda_version or 'unknown'}"
             )
+
+        # cuLA KDA target-verify is a linear-chain kernel. The ring-free
+        # ReplaySSM variant also skips per-step full-state snapshots, so it
+        # cannot service radix tracking or the disaggregated pool yet.
+        verify = self.linear_attn_verify_backend
+        if verify in ("cula", "cula-replayssm"):
+            if self.speculative_eagle_topk not in (None, 1):
+                raise ValueError(
+                    f"--linear-attn-verify-backend {verify} requires a linear "
+                    "draft chain (--speculative-eagle-topk in {None, 1})."
+                )
+        if verify == "cula-replayssm":
+            if not self.disable_radix_cache:
+                raise ValueError(
+                    "--linear-attn-verify-backend cula-replayssm requires "
+                    "--disable-radix-cache because accepted-prefix tracking "
+                    "needs per-step full-state snapshots."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--linear-attn-verify-backend cula-replayssm is not "
+                    "supported under PD disaggregation yet."
+                )
 
         # GDN ReplaySSM buffered decode guards. Runs on the Triton GDN decode
         # backend. cuda-graph is supported (slice 1b: CUDA-graph-safe static
